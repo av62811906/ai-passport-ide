@@ -1,0 +1,13 @@
+# Simulator build output
+build/
+
+# LVGL sources fetched by tools/simulator/fetch_lvgl.sh
+managed_components/
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# macOS
+.DS_Store
