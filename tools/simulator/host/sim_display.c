@@ -7,6 +7,8 @@
 
 #include "bsp_display.h"            // BSP_LVGL_SCREEN_RADIUS
 #include "bsp_display_rounding.h"   // bsp_display_rounded_row_span
+#include "esp_lcd_panel_io.h"
+#include "esp_lcd_panel_ops.h"
 #include "lvgl.h"
 
 #include <string.h>
@@ -68,4 +70,59 @@ const uint16_t *sim_framebuffer(int *width, int *height, int *stride_px) {
     if (height) *height = SIM_LCD_H;
     if (stride_px) *stride_px = SIM_LCD_W;
     return s_fb;
+}
+
+// ---------------------------------------------------------------------------
+// Direct panel path (PokeWalk game pages)
+// ---------------------------------------------------------------------------
+// The game owns the panel while it is in the foreground: it pauses the LVGL
+// refresh timer and pushes 240x80 bands itself. Its band buffer is already
+// byte-swapped to the ST7789's big-endian RGB565, so the bytes read back as the
+// little-endian RGB565 the mirror expects only after swapping them again.
+void sim_display_blit_be(int x_start, int y_start, int x_end, int y_end,
+                         const void *color_data) {
+    if (!color_data) return;
+    if (x_start < 0) x_start = 0;
+    if (y_start < 0) y_start = 0;
+    if (x_end > SIM_LCD_W) x_end = SIM_LCD_W;
+    if (y_end > SIM_LCD_H) y_end = SIM_LCD_H;
+    const int width = x_end - x_start;
+    if (width <= 0 || y_end <= y_start) return;
+
+    const uint8_t *src = (const uint8_t *)color_data;
+    for (int y = y_start; y < y_end; ++y) {
+        uint16_t *row = &s_fb[(size_t)y * SIM_LCD_W + x_start];
+        const uint8_t *s = src + (size_t)(y - y_start) * (size_t)width * 2;
+        for (int x = 0; x < width; ++x) {
+            row[x] = (uint16_t)((s[x * 2] << 8) | s[x * 2 + 1]);
+        }
+    }
+}
+
+// The game asks for the panel/io handles so it can draw without LVGL. On the
+// desktop both are backed by the one static framebuffer above, so the handles
+// only need to be non-NULL and stable.
+static char s_panel_handle;
+static char s_io_handle;
+
+esp_lcd_panel_handle_t bsp_display_panel(void) {
+    return (esp_lcd_panel_handle_t)&s_panel_handle;
+}
+
+esp_lcd_panel_io_handle_t bsp_display_io(void) {
+    return (esp_lcd_panel_io_handle_t)&s_io_handle;
+}
+
+esp_err_t esp_lcd_panel_io_tx_param(esp_lcd_panel_io_handle_t io, int lcd_cmd,
+                                    const void *param, size_t param_size) {
+    (void)io; (void)lcd_cmd; (void)param; (void)param_size;
+    return ESP_OK;   // the host blit is synchronous; no DMA to drain
+}
+
+esp_err_t esp_lcd_panel_draw_bitmap(esp_lcd_panel_handle_t panel, int x_start,
+                                    int y_start, int x_end, int y_end,
+                                    const void *color_data) {
+    (void)panel;
+    sim_display_blit_be(x_start, y_start, x_end, y_end, color_data);
+    return ESP_OK;
 }

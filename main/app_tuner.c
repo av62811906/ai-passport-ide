@@ -149,6 +149,10 @@ static float s_shown_cents;
 static int s_idle_frames;
 static bool s_dimmed;
 
+// 采集任务句柄与运行标志:app_tuner_exit() 靠它们先停任务、再删界面。
+static TaskHandle_t s_capture_task;
+static volatile bool s_capture_run;
+
 // 应用自有字体描述符:tuner_font_20 只有 ASCII + 本项目用到的汉字,
 // 缺的字形(如 LV_SYMBOL_*)回落到已启用的 Montserrat 20。
 LV_FONT_DECLARE(tuner_font_20);
@@ -446,6 +450,7 @@ static void capture_task(void *arg) {
             show_idle_locked();
             bsp_lvgl_unlock();
         }
+        s_capture_task = NULL;
         vTaskDelete(NULL);
         return;
     }
@@ -461,6 +466,7 @@ static void capture_task(void *arg) {
             show_idle_locked();
             bsp_lvgl_unlock();
         }
+        s_capture_task = NULL;
         vTaskDelete(NULL);
         return;
     }
@@ -468,7 +474,7 @@ static void capture_task(void *arg) {
     int hold = TUNER_HOLD_FRAMES;
     unsigned frame = 0;
 
-    for (;;) {
+    while (s_capture_run) {
         if (bsp_audio_read(s_window + TUNER_HOP, half_bytes) != ESP_OK) {
             ESP_LOGW(TAG, "麦克风读取失败,停止采集");
             break;
@@ -539,23 +545,26 @@ static void capture_task(void *arg) {
         ++frame;
     }
 
-    // 读取失败退出:界面降级为"无信号",任务结束。
-    if (bsp_lvgl_lock(200)) {
-        s_audio_ready = false;
-        s_have_reading = false;
-        show_idle_locked();
-        bsp_lvgl_unlock();
+    // 只有非主动停止(如读取失败)才把界面降级为"无信号";主动停止时界面即将被删除。
+    if (s_capture_run) {
+        if (bsp_lvgl_lock(200)) {
+            s_audio_ready = false;
+            s_have_reading = false;
+            show_idle_locked();
+            bsp_lvgl_unlock();
+        }
     }
+    s_capture_task = NULL;
     vTaskDelete(NULL);
 }
 
 // ---------------------------------------------------------------------------
 // 对外接口
 // ---------------------------------------------------------------------------
-void app_tuner_start(bool audio_ready) {
+bool app_tuner_start(bool audio_ready) {
     if (!bsp_lvgl_lock(1000)) {
         ESP_LOGE(TAG, "获取 LVGL 锁失败,调音器界面未创建");
-        return;
+        return false;
     }
     s_audio_ready = audio_ready;
     s_auto_mode = true;
@@ -570,12 +579,15 @@ void app_tuner_start(bool audio_ready) {
 
     if (!audio_ready) {
         ESP_LOGW(TAG, "音频不可用,调音器进入无信号界面");
-        return;
+        return true;
     }
 
     // 采集任务自己负责首次 bsp_audio_set_format;创建失败则降级为无信号界面。
+    s_capture_run = true;
     if (xTaskCreate(capture_task, "tuner_capture", TUNER_TASK_STACK, NULL,
-                    TUNER_TASK_PRIORITY, NULL) != pdPASS) {
+                    TUNER_TASK_PRIORITY, &s_capture_task) != pdPASS) {
+        s_capture_task = NULL;
+        s_capture_run = false;
         ESP_LOGE(TAG, "采集任务创建失败,退化为无信号界面");
         if (bsp_lvgl_lock(200)) {
             s_audio_ready = false;
@@ -583,6 +595,35 @@ void app_tuner_start(bool audio_ready) {
             bsp_lvgl_unlock();
         }
     }
+    return true;
+}
+
+void app_tuner_exit(void) {
+    // 先让采集任务收尾。它只在 bsp_audio_read 上阻塞约 32ms,很快就能返回并自行删除。
+    s_capture_run = false;
+    for (int i = 0; i < 100 && s_capture_task; ++i) {
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    if (s_capture_task) {
+        // 兜底:任务未在约 1s 内退出,强制删除,避免它访问即将删除的界面对象。
+        ESP_LOGW(TAG, "采集任务未及时退出,强制删除");
+        vTaskDelete(s_capture_task);
+        s_capture_task = NULL;
+    }
+
+    if (!bsp_lvgl_lock(500)) {
+        ESP_LOGE(TAG, "获取 LVGL 锁失败,调音器界面未删除");
+        return;
+    }
+    if (s_scr) {
+        // 删除调音器屏。前置条件:调用方必须在【持 LVGL 锁】的换页序列里调用本函数,
+        // 并在释放锁之前载入新屏(见 main.c 的两条约束)。这里必须真的删掉 ——
+        // 调音器的控件占 LVGL 池,不释放就装不下下一页的界面。
+        lv_obj_del(s_scr);
+        s_scr = NULL;
+    }
+    s_have_reading = false;
+    bsp_lvgl_unlock();
 }
 
 void app_tuner_handle_key(bsp_btn_t btn, bsp_btn_ev_t event) {

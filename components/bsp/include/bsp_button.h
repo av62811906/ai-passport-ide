@@ -3,6 +3,7 @@
 #pragma once
 
 #include "esp_err.h"
+#include <stdbool.h>
 
 // 按键索引。数量用 bsp_pins.h 的 BSP_BTN_COUNT(硬件属性,归引脚表管),
 // 这里不再定义尾项计数,避免出现 BSP_BTN_COUNT / BSP_BTN_COUNT_ 两个近似名字。
@@ -17,7 +18,18 @@ typedef enum {
     BSP_BTN_CLICK,       // 单击(按下并抬起)
     BSP_BTN_DOUBLE,      // 双击
     BSP_BTN_LONG,        // 长按
+    BSP_BTN_RELEASE = 4, // 去抖确认松开；短按时先 RELEASE，双击窗口结束后才 CLICK
+    BSP_BTN_GESTURE_END = 5, // 库已完成整组单/双/连按分类；此后才开始下一次独立手势
 } bsp_btn_ev_t;
+
+// 长按时值。A/B(上/下)用 600ms，C(确定)长按用于熄屏/退出，保留较长门槛。
+#define BSP_BTN_LONG_PRESS_MS  600
+#define BSP_BTN_SHORT_PRESS_MS 180
+#define BSP_BTN_EXIT_PRESS_MS  1500
+
+// 诊断用:只观察不触发游戏动作，同时保留 release/end 清理。
+// 观察期内开始的手势会被抑制到 GESTURE_END。
+void bsp_button_observe_only(bool enabled);
 
 // 按键事件回调。运行于 button 组件使用的共享 esp_timer 任务,只能入队或执行同等级
 // 的有界操作；勿在其中阻塞、访问 LVGL 或做重活。

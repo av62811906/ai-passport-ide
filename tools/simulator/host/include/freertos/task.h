@@ -1,7 +1,7 @@
 // tools/simulator/host/include/freertos/task.h
-// Host-side shim of <freertos/task.h>. xTaskCreate reports success but does not
-// spawn a thread: the simulated app is started with audio unavailable, so the
-// tuner's capture_task is never entered. The symbols exist only to link.
+// Host-side shim of <freertos/task.h>. xTaskCreate() really spawns a pthread;
+// the returned handle stays valid for the task's whole life so applications can
+// wait for completion or force-delete the task, mirroring FreeRTOS semantics.
 #pragma once
 
 #include "freertos/FreeRTOS.h"

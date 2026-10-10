@@ -8,8 +8,8 @@ a status bar.
 Two colour themes (a PyCharm-like dark and an IntelliJ-like light) switch at run
 time.
 
-Saving a source file rebuilds the simulator library and restarts the process, so
-the change is visible in the device mirror right away.
+Saving a source file rebuilds the simulator library and swaps it in place, so the
+change is visible in the device mirror right away without restarting this IDE.
 
 Usage:
     tools/simulator/run.sh                  # build + launch
@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import io
 import os
 import platform
 import queue
@@ -50,11 +51,21 @@ from backend import (  # noqa: E402
     EV_LONG,
     create_backend,
     default_library_path,
+    stage_library,
+    validate_library,
 )
 from audio_input import SAMPLE_RATE, MicCapture  # noqa: E402
 from ide_editor import CodeEditor, EditorTabs, SourceExplorer, ThemedScrollbar  # noqa: E402
+from ide_flash import (  # noqa: E402
+    MODE_FULL,
+    MODE_INCREMENTAL,
+    build_flash_job,
+    find_idf_root,
+    list_serial_ports,
+)
 from ide_layout import SRC_HEIGHT, SRC_WIDTH, fit_scale, zoom_factor  # noqa: E402
 from ide_sources import is_within, list_sources, newline_style, normalize_newlines  # noqa: E402
+from ide_watch import changed_paths, is_stale, snapshot, watch_files  # noqa: E402
 
 # Long-press threshold for a virtual button to emit a LONG event instead of CLICK.
 LONG_PRESS_MS = 700
@@ -77,9 +88,24 @@ MAX_ZOOM = 8
 
 MAX_LOG_LINES = 2000
 
+# External-change watch. Polling a few dozen small files is cheap; a change is
+# only acted on once the tree has stayed quiet for WATCH_DEBOUNCE_MS, so an
+# editor or an agent writing several files in a row causes one rebuild.
+WATCH_MS = 700
+WATCH_DEBOUNCE_MS = 900
+
+# How often the flash page rescans the serial ports while it is visible. The
+# scan only reads device metadata, so a couple of seconds costs nothing.
+PORT_SCAN_MS = 2000
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 MAIN_DIR = REPO_ROOT / "main"
 BUILD_SCRIPT = Path(__file__).resolve().parent / "build.sh"
+
+# The bottom log panel is mirrored to this file so a terminal or an AI agent can
+# read the same session log without the GUI. It is truncated at each launch; one
+# line per panel entry, prefixed with the local time and the entry's level tag.
+LOG_PATH = REPO_ROOT / "build" / "simulator" / "ide.log"
 
 
 DARK = {
@@ -146,6 +172,7 @@ THEME_LABELS = {"dark": "深色", "light": "浅色"}
 PAGES = (
     ("sources", "文", "资源管理器"),
     ("device", "设", "设备"),
+    ("flash", "烧", "烧录"),
     ("audio", "音", "音频"),
     ("keys", "键", "快捷键"),
 )
@@ -238,6 +265,10 @@ class IdeApp:
         self.mic = mic
         self.audio_ready = audio_ready
         self.audio_note = audio_note
+        # The audio state the running application was started with. The device
+        # only creates its capture task when it enters with audio available, so
+        # a change here means the application must be restarted to take effect.
+        self._app_audio = audio_ready
         self.theme = theme
         self.palette = THEMES[theme]
         self.fixed_scale = fixed_scale
@@ -267,19 +298,78 @@ class IdeApp:
         self._building = False
         self._build_pending = False
         self._build_note = ""
+        # External-change watch: the source files the build reads, the last state
+        # seen for them, and the files awaiting the debounce window.
+        self._watch_files = watch_files(REPO_ROOT)
+        self._watch_state = snapshot(self._watch_files)
+        self._watch_changed: set[Path] = set()
+        self._watch_pending_at: float | None = None
+        # Hot swap state: the private library copy currently loaded, and the
+        # counter that keeps every swap's path unique within this process.
+        self._swap_serial = 0
+        self._staged: Path | None = None
 
+        # Flashing state: the detected ESP-IDF checkout, the serial ports seen
+        # on the host, the chosen target, and the worker thread's queue. Port
+        # rows are recoloured directly (not through the theme registry) because
+        # they are rebuilt whenever the device list changes.
+        self._idf_root = find_idf_root()
+        self._ports: list = []
+        self._port_signature: list[tuple] | None = None
+        self._port_row_parts: list[dict] = []
+        self._selected_port: str | None = None
+        self._flash_scan_at = 0.0
+        self._flash_queue: queue.Queue[tuple[str, str]] = queue.Queue()
+        self._flashing = False
+        self._flash_note = ""
+
+        # Mirrored log file; None when it cannot be opened. The GUI panel stays
+        # the primary view, so a missing file must never block startup.
+        self._log_handle = self._open_log_file()
         self._cleanup_stale_library()
         self._build_ui()
+        if self._log_handle is not None:
+            print(f"IDE log: {LOG_PATH}", flush=True)
+            self._log_line(f"[ide] 日志同步到 {LOG_PATH}", "build")
         self._register_keys()
         self.apply_theme(theme)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+        self._rebuild_if_sources_are_newer()
 
     def _cleanup_stale_library(self) -> None:
-        """Remove a ``*.old`` library left behind by an interrupted relaunch."""
+        """Remove library leftovers from a previous session.
+
+        ``*.old`` is the rename-aside copy an interrupted build leaves behind;
+        ``libpassport_sim.<token>.*`` are the private copies earlier hot swaps
+        loaded, which a new process does not need (and must not reuse).
+        """
         stale = self.lib_path.with_name(self.lib_path.name + ".old")
         try:
             stale.unlink(missing_ok=True)
         except OSError:
+            pass
+        for path in self.lib_path.parent.glob(f"{self.lib_path.stem}.*{self.lib_path.suffix}"):
+            try:
+                path.unlink()
+            except OSError:
+                pass
+
+    def _open_log_file(self) -> io.TextIOWrapper | None:
+        """Open the mirrored log file, or return None when it is unavailable."""
+        try:
+            LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+            return LOG_PATH.open("w", encoding="utf-8", buffering=1)
+        except OSError:
+            return None
+
+    def _write_log_file(self, line: str, tag: str | None) -> None:
+        """Append one panel entry to the mirrored file; never raise."""
+        handle = self._log_handle
+        if handle is None:
+            return
+        try:
+            handle.write(f"{time.strftime('%H:%M:%S')} [{tag or 'info'}] {line}\n")
+        except (OSError, ValueError):
             pass
 
     # -- theming ------------------------------------------------------------
@@ -318,6 +408,7 @@ class IdeApp:
 
         self.theme_var.set(name)
         self.toolbar_theme_button.configure(text=f"主题 · {THEME_LABELS[name]}")
+        self._style_port_rows()
         self._select_page(self.page)
         self._render_preview(force=True)
 
@@ -451,7 +542,16 @@ class IdeApp:
         run_menu = tk.Menu(menubar, tearoff=0)
         self._menus.append(run_menu)
         run_menu.add_command(
-            label="重新编译并重启", accelerator=f"{accel}R", command=self._run_build
+            label="重新编译并热更新", accelerator=f"{accel}R", command=self._run_build
+        )
+        run_menu.add_separator()
+        run_menu.add_command(
+            label="烧录到设备（增量）",
+            command=lambda: self._start_flash(MODE_INCREMENTAL),
+        )
+        run_menu.add_command(
+            label="烧录完整镜像（重置 NVS）",
+            command=lambda: self._start_flash(MODE_FULL),
         )
         menubar.add_cascade(label="运行", menu=run_menu)
 
@@ -461,6 +561,13 @@ class IdeApp:
         device_menu.add_command(label="确定", command=lambda: self._send(BTN_OK, EV_CLICK))
         device_menu.add_command(label="下", command=lambda: self._send(BTN_DOWN, EV_CLICK))
         menubar.add_cascade(label="设备", menu=device_menu)
+
+        audio_menu = tk.Menu(menubar, tearoff=0)
+        self._menus.append(audio_menu)
+        audio_menu.add_command(
+            label="开关麦克风", accelerator=f"{accel}M", command=self._toggle_microphone
+        )
+        menubar.add_cascade(label="音频", menu=audio_menu)
 
         help_menu = tk.Menu(menubar, tearoff=0)
         self._menus.append(help_menu)
@@ -489,6 +596,13 @@ class IdeApp:
         self._flat_button(right, "缩小", lambda: self._zoom_by(-1)).pack(side="right", padx=2)
         self._flat_button(right, "适应窗口", self._fit).pack(side="right", padx=2)
         self._flat_button(right, "保存", self._save_active).pack(side="right", padx=2)
+        self._flat_button(
+            right, "烧录", lambda: self._start_flash(MODE_INCREMENTAL)
+        ).pack(side="right", padx=2)
+        self.mic_button = self._flat_button(
+            right, f"麦克风 · {'开' if self.audio_ready else '关'}", self._toggle_microphone
+        )
+        self.mic_button.pack(side="right", padx=2)
 
     # Buttons are Labels, not tk.Buttons: on macOS tk.Button is drawn by the
     # native (light) appearance and ignores -background/-foreground, which would
@@ -602,6 +716,7 @@ class IdeApp:
 
         self._build_sources_page()
         self._build_device_page()
+        self._build_flash_page()
         self._build_audio_page()
         self._build_keys_page()
         self.page = "sources"
@@ -677,6 +792,231 @@ class IdeApp:
             bg="panel_bg", fg="fg_muted",
         ).pack(fill="x", padx=12, pady=(6, 0))
 
+    def _build_flash_page(self) -> None:
+        page = self.pages["flash"]
+        body = tk.Frame(page)
+        body.pack(fill="x", pady=(6, 4))
+        self._theme(body, bg="panel_bg")
+
+        self.idf_var = tk.StringVar(value="")
+        idf_row = tk.Frame(body)
+        idf_row.pack(fill="x", padx=12, pady=2)
+        self._theme(idf_row, bg="panel_bg")
+        self._theme(
+            tk.Label(idf_row, text="ESP-IDF", font=self.font_small, anchor="w"),
+            bg="panel_bg", fg="fg_muted",
+        ).pack(side="top", fill="x")
+        self._theme(
+            tk.Label(
+                idf_row, textvariable=self.idf_var, font=self.font_small, anchor="w",
+                justify="left", wraplength=SIDEBAR_WIDTH - 30,
+            ),
+            bg="panel_bg", fg="fg",
+        ).pack(side="top", fill="x")
+
+        self._section_header(page, "串口设备")
+        controls = tk.Frame(page)
+        controls.pack(fill="x", padx=12, pady=(6, 2))
+        self._theme(controls, bg="panel_bg")
+        self._flat_button(controls, "刷新", self._refresh_ports, bg="panel_bg").pack(side="left")
+        self.port_hint_var = tk.StringVar(value="")
+        self._theme(
+            tk.Label(controls, textvariable=self.port_hint_var, font=self.font_small, anchor="w"),
+            bg="panel_bg", fg="fg_muted",
+        ).pack(side="left", padx=(8, 0))
+
+        self.ports_frame = tk.Frame(page)
+        self.ports_frame.pack(fill="x", padx=12, pady=(4, 0))
+        self._theme(self.ports_frame, bg="panel_bg")
+
+        self._section_header(page, "烧录")
+        actions = tk.Frame(page)
+        actions.pack(fill="x", padx=12, pady=(6, 0))
+        self._theme(actions, bg="panel_bg")
+        self._flat_button(
+            actions, "增量烧录", lambda: self._start_flash(MODE_INCREMENTAL), bg="panel_bg"
+        ).pack(side="left")
+        self._flat_button(
+            actions, "完整镜像", lambda: self._start_flash(MODE_FULL), bg="panel_bg"
+        ).pack(side="left", padx=6)
+
+        self.flash_note_var = tk.StringVar(value="")
+        self._theme(
+            tk.Label(
+                page, textvariable=self.flash_note_var, font=self.font_small,
+                anchor="w", justify="left", wraplength=SIDEBAR_WIDTH - 30,
+            ),
+            bg="panel_bg", fg="fg",
+        ).pack(fill="x", padx=12, pady=(8, 0))
+        self._theme(
+            tk.Label(
+                page,
+                text="增量烧录保留设备 NVS；完整镜像从 0x0 写入，会重置 NVS。",
+                font=self.font_small, anchor="w", justify="left",
+                wraplength=SIDEBAR_WIDTH - 30,
+            ),
+            bg="panel_bg", fg="fg_muted",
+        ).pack(fill="x", padx=12, pady=(6, 0))
+
+        self._refresh_ports()
+
+    # -- device discovery ----------------------------------------------------
+    def _refresh_ports(self) -> None:
+        """Rescan ESP-IDF and the serial ports; rebuild rows only on change."""
+        self._idf_root = find_idf_root()
+        self.idf_var.set(
+            str(self._idf_root) if self._idf_root else "未找到（激活 export.sh 或设置 AI_PASSPORT_IDF_ROOT）"
+        )
+        ports = list_serial_ports()
+        signature = [(port.device, port.description, port.likely_esp) for port in ports]
+        if signature == self._port_signature:
+            return
+        self._port_signature = signature
+        self._ports = ports
+        devices = {port.device for port in ports}
+        if self._selected_port not in devices:
+            preferred = next((port.device for port in ports if port.likely_esp), None)
+            self._selected_port = preferred or (ports[0].device if ports else None)
+        self._rebuild_port_rows()
+
+    def _rebuild_port_rows(self) -> None:
+        for parts in self._port_row_parts:
+            parts["row"].destroy()
+        self._port_row_parts = []
+        if not self._ports:
+            self.port_hint_var.set("未发现设备，请检查 USB 连接")
+            return
+        self.port_hint_var.set(f"发现 {len(self._ports)} 个设备")
+        for port in self._ports:
+            self._port_row_parts.append(self._port_row(port))
+        self._style_port_rows()
+
+    def _port_row(self, port) -> dict:
+        row = tk.Frame(self.ports_frame, cursor="hand2")
+        row.pack(fill="x", pady=1)
+        parts = {"row": row, "device": port.device}
+        parts["marker"] = tk.Label(row, text="", width=2, takefocus=0, font=self.font_small)
+        parts["marker"].pack(side="left")
+        info = tk.Frame(row)
+        info.pack(side="left", fill="x", expand=True)
+        parts["info"] = info
+        title = port.device + ("   · ESP32 可能" if port.likely_esp else "")
+        parts["name"] = tk.Label(
+            info, text=title, anchor="w", takefocus=0, font=self.font_small,
+            justify="left", wraplength=SIDEBAR_WIDTH - 60,
+        )
+        parts["name"].pack(fill="x")
+        parts["desc"] = tk.Label(
+            info, text=port.description or "未知设备", anchor="w", takefocus=0,
+            font=self.font_small, justify="left", wraplength=SIDEBAR_WIDTH - 60,
+        )
+        parts["desc"].pack(fill="x")
+        for widget in (row, parts["marker"], info, parts["name"], parts["desc"]):
+            widget.bind("<Button-1>", lambda _e, device=port.device: self._select_port(device))
+        return parts
+
+    def _style_port_rows(self) -> None:
+        """Recolour the port rows; they are rebuilt often, so they skip the
+        theme registry and are repainted from the current palette instead."""
+        palette = self.palette
+        for parts in self._port_row_parts:
+            selected = parts["device"] == self._selected_port
+            bg = palette["selection"] if selected else palette["panel_bg"]
+            parts["row"].configure(bg=bg)
+            parts["info"].configure(bg=bg)
+            parts["marker"].configure(
+                text="●" if selected else "○",
+                bg=bg, fg=palette["accent"] if selected else palette["fg_muted"],
+            )
+            parts["name"].configure(bg=bg, fg=palette["accent"] if selected else palette["fg"])
+            parts["desc"].configure(bg=bg, fg=palette["fg_muted"])
+
+    def _select_port(self, device: str) -> None:
+        self._selected_port = device
+        self._style_port_rows()
+        self._log_line(f"[flash] 目标设备 {device}", "build")
+
+    # -- flashing ------------------------------------------------------------
+    def _start_flash(self, mode: str) -> None:
+        self._select_page("flash")
+        if self._flashing:
+            self._log_line("[flash] 正在烧录，请等待当前任务结束", "warn")
+            return
+        idf_root = self._idf_root or find_idf_root()
+        self._idf_root = idf_root
+        if idf_root is None:
+            self._log_line(
+                "[flash] 未找到 ESP-IDF 5.5.3；请先激活 export.sh 或设置 AI_PASSPORT_IDF_ROOT", "err"
+            )
+            return
+        if self._selected_port is None:
+            self._refresh_ports()
+        if self._selected_port is None:
+            self._log_line("[flash] 未选择串口设备；请连接设备后点击“刷新”", "err")
+            return
+        if mode == MODE_FULL and not messagebox.askyesno(
+            "完整镜像烧录",
+            f"将从 0x0 写入完整镜像到：\n{self._selected_port}\n\n"
+            "这会重置设备上的 NVS 设置（存档等）。是否继续？",
+        ):
+            return
+        try:
+            job = build_flash_job(mode, idf_root, self._selected_port, REPO_ROOT)
+        except (OSError, ValueError) as exc:
+            self._log_line(f"[flash] 无法构建烧录命令: {exc}", "err")
+            return
+        self._flashing = True
+        self._flash_note = f"{job.description}…"
+        self.flash_note_var.set(self._flash_note)
+        self._log_line(f"[flash] {job.description} → {self._selected_port}", "host")
+        threading.Thread(target=self._flash_worker, args=(job,), daemon=True).start()
+
+    def _flash_worker(self, job) -> None:
+        """Run the flashing command, streaming its output to the queue."""
+        try:
+            process = subprocess.Popen(
+                job.argv,
+                cwd=str(REPO_ROOT),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+            )
+            assert process.stdout is not None
+            for line in process.stdout:
+                self._flash_queue.put(("line", line.rstrip("\n")))
+            code = process.wait()
+        except Exception as exc:  # noqa: BLE001 - surface any launch failure
+            self._flash_queue.put(("error", f"[flash] 无法启动烧录: {exc}"))
+            self._flash_queue.put(("done", "fail"))
+            return
+        self._flash_queue.put(("done", "ok" if code == 0 else "fail"))
+
+    def _drain_flash(self) -> None:
+        while True:
+            try:
+                kind, payload = self._flash_queue.get_nowait()
+            except queue.Empty:
+                return
+            if kind == "line":
+                lowered = payload.lower()
+                tag = "err" if ("error" in lowered or "失败" in payload) else "build"
+                self._log_line(payload, tag)
+            elif kind == "error":
+                self._log_line(payload, "err")
+            else:
+                self._on_flash_done(payload)
+
+    def _on_flash_done(self, result: str) -> None:
+        self._flashing = False
+        if result == "ok":
+            self._flash_note = "烧录完成"
+            self._log_line("[flash] 烧录完成", "host")
+        else:
+            self._flash_note = "烧录失败"
+            self._log_line("[flash] 烧录失败，请查看上方日志", "err")
+        self.flash_note_var.set(self._flash_note)
+
     def _build_audio_page(self) -> None:
         page = self.pages["audio"]
         body = tk.Frame(page)
@@ -690,9 +1030,24 @@ class IdeApp:
         self._key_value_row(body, "采样率", self.audio_rate_var)
         self._key_value_row(body, "格式", self.audio_format_var)
 
-        note = self.audio_note or "麦克风已连接，可驱动调音器。"
+        if not self.audio_note:
+            self.audio_note = (
+                "麦克风已连接，可驱动调音器。" if self.audio_ready else "麦克风不可用（无信号模式）。"
+            )
+        controls = tk.Frame(page)
+        controls.pack(fill="x", padx=12, pady=(8, 0))
+        self._theme(controls, bg="panel_bg")
+        self.audio_mic_button = self._flat_button(
+            controls,
+            "关闭麦克风" if self.audio_ready else "开启麦克风",
+            self._toggle_microphone,
+            bg="panel_bg",
+        )
+        self.audio_mic_button.pack(side="left")
+
+        self.audio_note_var = tk.StringVar(value=self.audio_note)
         self._theme(
-            tk.Label(page, text=note, font=self.font_small, justify="left", anchor="w", wraplength=SIDEBAR_WIDTH - 30),
+            tk.Label(page, textvariable=self.audio_note_var, font=self.font_small, justify="left", anchor="w", wraplength=SIDEBAR_WIDTH - 30),
             bg="panel_bg", fg="fg_muted",
         ).pack(fill="x", padx=12, pady=(10, 0))
         self._theme(
@@ -715,10 +1070,11 @@ class IdeApp:
             ("F11 / Esc", "进入 / 退出全屏"),
             (f"{self._accel}0", "适应窗口"),
             (f"{self._accel}= / {self._accel}-", "放大 / 缩小"),
-            (f"{self._accel}S", "保存（并自动重编重启）"),
+            (f"{self._accel}S", "保存（并自动重编热更新）"),
             (f"{self._accel}W", "关闭当前标签"),
             (f"{self._accel}R", "保存全部并重新编译"),
             (f"{self._accel}L", "清空日志"),
+            (f"{self._accel}M", "开关麦克风"),
             (f"{self._accel}⇧T", "切换深/浅主题"),
         )
         body = tk.Frame(page)
@@ -906,6 +1262,13 @@ class IdeApp:
         self.log_text.configure(state="normal")
         self.log_text.delete("1.0", "end")
         self.log_text.configure(state="disabled")
+        handle = self._log_handle
+        if handle is not None:
+            try:
+                handle.seek(0)
+                handle.truncate()
+            except (OSError, ValueError):
+                pass
 
     def _show_about(self) -> None:
         messagebox.showinfo(
@@ -914,7 +1277,7 @@ class IdeApp:
             "桌面仿真器：在电脑上镜像 240×320 设备界面，\n"
             "用虚拟按键或键盘驱动应用，并实时查看设备日志。\n\n"
             "资源管理器展示要拷贝进 AI Passport 的 main/ 源码；\n"
-            "保存源码会自动重新编译并重启本 IDE。",
+            "保存源码会自动重新编译并热更新（不重启本窗口）。",
         )
 
     # -- documents -----------------------------------------------------------
@@ -1019,6 +1382,7 @@ class IdeApp:
         doc.dirty = False
         self.tabs.set_dirty(str(doc.path), False)
         self.explorer.set_dirty(doc.path, False)
+        self._note_own_write(doc.path)
         self._log_line(f"[ide] 已保存 {doc.path.name}", "build")
         return True
 
@@ -1074,11 +1438,9 @@ class IdeApp:
             self._build_queue.put(("done", "fail"))
             return
         if self.lib_path.exists():
-            try:
-                backup.unlink(missing_ok=True)
-            except OSError:
-                pass
-            self._build_queue.put(("done", "restart"))
+            # Keep the previous library until the new one has been validated and
+            # swapped in, so a build that turns out to crash can be rolled back.
+            self._build_queue.put(("done", "swap"))
             return
         # Nothing to relink (for example a header nobody includes): keep the
         # library that is currently loaded instead of restarting into nothing.
@@ -1111,29 +1473,256 @@ class IdeApp:
 
     def _on_build_done(self, result: str) -> None:
         self._building = False
-        if result == "restart":
-            self._relaunch()
+        if result == "swap":
+            self._hot_swap()
             return
         self._build_note = "构建失败" if result == "fail" else ""
         if self._build_pending:
             self._request_build()
 
-    def _relaunch(self) -> None:
-        """Replace this process so the freshly built library is loaded."""
-        self._build_note = "已重启"
-        self._running = False
+    def _hot_swap(self) -> None:
+        """Load the freshly built library in place, keeping this session.
+
+        The window, the open editor tabs and the log all survive; only the
+        simulated application is restarted, so the mirror returns to its home
+        page. The candidate is booted in a throwaway process first: application
+        code that crashes (a bad pointer, a failed assertion) would otherwise
+        take this whole IDE down, because it runs in this process through
+        ctypes. A candidate that fails leaves the running one in place.
+        """
+        backup = self.lib_path.with_name(self.lib_path.name + ".old")
         try:
-            if self.mic is not None:
-                self.mic.close()
-        except Exception:  # noqa: BLE001 - best effort before exec
-            pass
+            reason = validate_library(self.lib_path)
+        except Exception as exc:  # noqa: BLE001 - a failed check must not crash
+            reason = f"无法校验新仿真库: {exc}"
+        if reason is not None:
+            self._build_note = "运行时崩溃"
+            self._log_line(f"[ide] {reason}", "err")
+            self._log_line("[ide] 已跳过热更新，继续运行原仿真库", "err")
+            self._restore_backup(backup)
+            return
+
+        token = f"{os.getpid()}.{self._swap_serial}"
+        self._swap_serial += 1
         try:
-            self.backend.shutdown()
-        except Exception:  # noqa: BLE001 - best effort before exec
+            staged = stage_library(self.lib_path, token)
+        except OSError as exc:
+            self._build_note = "热更新失败"
+            self._log_line(f"[ide] 无法准备新仿真库: {exc}", "err")
+            self._restore_backup(backup)
+            return
+        # Stop the microphone first: its callback thread pushes into whichever
+        # library the backend holds.
+        self._close_microphone()
+        try:
+            self.backend.swap(staged, self.audio_ready)
+        except Exception as exc:  # noqa: BLE001 - keep the running instance
+            self._build_note = "热更新失败"
+            self._log_line(f"[ide] 热更新失败，继续使用原仿真库: {exc}", "err")
+            self._reopen_microphone()
+            return
+        # The new library is running: the previous one is no longer needed.
+        try:
+            backup.unlink(missing_ok=True)
+        except OSError:
             pass
-        sys.stdout.flush()
-        sys.stderr.flush()
-        os.execv(sys.executable, [sys.executable] + sys.argv)
+        if self._staged is not None:
+            try:
+                self._staged.unlink(missing_ok=True)
+            except OSError:
+                pass
+        self._staged = staged
+        # The new instance draws from scratch: drop the cached frame so the
+        # mirror is decoded again even if its first frame looks unchanged.
+        self._last_raw = None
+        self._app_audio = self.audio_ready
+        self._reopen_microphone()
+        self._build_note = "已热更新"
+        self._log_line("[ide] 已热更新仿真库（未重启进程）", "build")
+
+    def _close_microphone(self) -> None:
+        if self.mic is None:
+            return
+        try:
+            self.mic.close()
+        except Exception:  # noqa: BLE001 - best effort before the swap
+            pass
+        self.mic = None
+
+    def _reopen_microphone(self) -> None:
+        """Attach a fresh capture stream to the library that is now loaded."""
+        if not self.audio_ready:
+            return
+        try:
+            mic = MicCapture(self.backend)
+            mic.open()
+        except Exception as exc:  # noqa: BLE001 - audio is optional
+            self.audio_ready = False
+            self.audio_note = f"热更新后麦克风不可用：{exc}"
+            self._log_line(f"[ide] 热更新后麦克风不可用: {exc}", "warn")
+            return
+        self.mic = mic
+
+    # -- microphone ----------------------------------------------------------
+    def _toggle_microphone(self) -> None:
+        self._set_microphone(not self.audio_ready)
+
+    def _set_microphone(self, enabled: bool) -> None:
+        """Turn host microphone capture on or off at run time.
+
+        Off closes the capture stream, so the tuner only sees silence; on opens
+        it again. The device application only creates its capture task when it
+        enters with audio available, so when that no longer matches the request
+        the simulated application is restarted to adopt the new state.
+        """
+        if enabled:
+            if self.mic is None:
+                try:
+                    mic = MicCapture(self.backend)
+                    mic.open()
+                except Exception as exc:  # noqa: BLE001 - audio is optional
+                    self.audio_note = f"无法开启麦克风：{exc}"
+                    self._log_line(f"[ide] 无法开启麦克风：{exc}", "warn")
+                    return
+                self.mic = mic
+            self.audio_ready = True
+            self.audio_note = "麦克风已开启，可驱动调音器。"
+            self._log_line("[ide] 麦克风已开启", "build")
+        else:
+            self._close_microphone()
+            self.audio_ready = False
+            self.audio_note = "麦克风已关闭，调音器进入无信号界面。"
+            self._log_line("[ide] 麦克风已关闭", "build")
+
+        if self._app_audio != self.audio_ready:
+            self._restart_app()
+        self._refresh_microphone_ui()
+
+    def _restart_app(self) -> None:
+        """Restart the simulated application without rebuilding it.
+
+        Needed so a microphone change reaches the device, which decides whether
+        to run its capture task when it enters a page. The window, the editors
+        and the log all survive; only the mirror returns to its home page.
+        """
+        if self._building:
+            return  # the running build adopts the new audio state when it swaps
+        token = f"{os.getpid()}.{self._swap_serial}"
+        self._swap_serial += 1
+        try:
+            staged = stage_library(self.lib_path, token)
+        except OSError as exc:
+            self._log_line(f"[ide] 无法重启仿真应用：{exc}", "err")
+            return
+        self._close_microphone()
+        try:
+            self.backend.swap(staged, self.audio_ready)
+        except Exception as exc:  # noqa: BLE001 - keep the running instance
+            self._log_line(f"[ide] 重启仿真应用失败：{exc}", "err")
+            self._reopen_microphone()
+            return
+        if self._staged is not None:
+            try:
+                self._staged.unlink(missing_ok=True)
+            except OSError:
+                pass
+        self._staged = staged
+        self._last_raw = None
+        self._app_audio = self.audio_ready
+        self._reopen_microphone()
+        self._log_line("[ide] 已重启仿真应用以应用麦克风状态", "build")
+
+    def _refresh_microphone_ui(self) -> None:
+        """Keep the microphone controls and the audio note in sync with state."""
+        on = self.audio_ready
+        self.mic_button.configure(text=f"麦克风 · {'开' if on else '关'}")
+        self.audio_mic_button.configure(text="关闭麦克风" if on else "开启麦克风")
+        self.audio_note_var.set(self.audio_note)
+
+    # -- external changes ----------------------------------------------------
+    def _rebuild_if_sources_are_newer(self) -> None:
+        """Rebuild once at startup when the sources moved on since the last build.
+
+        Without this the mirror would keep showing the library that was built
+        before an edit made while the IDE was not running.
+        """
+        if not self._watch_files or not is_stale(self._watch_files, self.lib_path):
+            return
+        self._log_line("[watch] 源码比仿真库新，正在重新编译…", "build")
+        self._request_build()
+
+    def _watch_tick(self) -> None:
+        if not self._running:
+            return
+        self._poll_watch()
+        self.root.after(WATCH_MS, self._watch_tick)
+
+    def _poll_watch(self) -> None:
+        """Notice edits made outside the IDE, then rebuild once they settle."""
+        current = snapshot(self._watch_files)
+        changed = changed_paths(self._watch_state, current)
+        if changed:
+            # Keep pushing the deadline out while files are still arriving, so a
+            # burst of edits ends in a single rebuild.
+            self._watch_state = current
+            self._watch_changed.update(changed)
+            self._watch_pending_at = time.monotonic()
+            return
+        if self._watch_pending_at is None or self._building:
+            return
+        if (time.monotonic() - self._watch_pending_at) * 1000 < WATCH_DEBOUNCE_MS:
+            return
+        self._watch_pending_at = None
+        pending = sorted(self._watch_changed, key=str)
+        self._watch_changed.clear()
+        self._apply_external_changes(pending)
+
+    def _apply_external_changes(self, changed: list[Path]) -> None:
+        """Refresh the shell for external edits, then rebuild the simulator."""
+        names = "、".join(path.name for path in changed)
+        self._log_line(f"[watch] 检测到外部修改：{names}", "build")
+        self.explorer.refresh(list_sources(MAIN_DIR))
+        for doc in self._docs.values():
+            self.explorer.set_dirty(doc.path, doc.dirty)
+        self._reload_external_documents(changed)
+        self._watch_state = snapshot(self._watch_files)
+        self._request_build()
+
+    def _reload_external_documents(self, changed: list[Path]) -> None:
+        """Reload open editors whose file changed on disk.
+
+        A document with unsaved IDE edits is left alone: the on-disk copy is not
+        silently pulled over what the user is typing.
+        """
+        touched = {str(path) for path in changed}
+        for key, doc in self._docs.items():
+            if key not in touched:
+                continue
+            if doc.dirty:
+                self._log_line(
+                    f"[watch] {doc.path.name} 在 IDE 内有未保存改动，已跳过外部内容", "warn"
+                )
+                continue
+            editor = self._editors.get(key)
+            if editor is None:
+                continue
+            try:
+                raw = doc.path.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError) as exc:
+                self._log_line(f"[watch] 无法重新加载 {doc.path.name}: {exc}", "err")
+                continue
+            editor.load(normalize_newlines(raw))
+            doc.newline = newline_style(raw)
+            self._log_line(f"[watch] 已重新加载 {doc.path.name}", "build")
+
+    def _note_own_write(self, path: Path) -> None:
+        """Record a save made by this IDE so the watcher ignores it."""
+        try:
+            info = path.stat()
+        except OSError:
+            return
+        self._watch_state = dict(self._watch_state)
+        self._watch_state[path] = (info.st_mtime_ns, info.st_size)
 
     # -- input ---------------------------------------------------------------
     def _register_keys(self) -> None:
@@ -1154,6 +1743,7 @@ class IdeApp:
             (f"<{mod}-w>", lambda _e: self._close_active_tab()),
             (f"<{mod}-r>", lambda _e: self._run_build()),
             (f"<{mod}-l>", lambda _e: self._clear_log()),
+            (f"<{mod}-m>", lambda _e: self._toggle_microphone()),
             (f"<{mod}-Shift-t>", lambda _e: self._toggle_theme()),
         ):
             self.root.bind(sequence, handler)
@@ -1189,6 +1779,7 @@ class IdeApp:
             self._log_line(line, tag)
 
     def _log_line(self, line: str, tag: str | None = None) -> None:
+        self._write_log_file(line, tag)
         self.log_text.configure(state="normal")
         self.log_text.insert("end", line + "\n", tag or ())
         count = int(self.log_text.index("end-1c").split(".")[0])
@@ -1256,16 +1847,21 @@ class IdeApp:
         self._render_preview()
         self._append_logs()
         self._drain_build()
+        self._drain_flash()
+        if self.page == "flash" and (time.monotonic() - self._flash_scan_at) * 1000 >= PORT_SCAN_MS:
+            self._flash_scan_at = time.monotonic()
+            self._refresh_ports()
 
         backlight = self.backend.backlight_percent()
         self._backlight = backlight
         audio = "麦克风" if self.audio_ready else "无（静音降级）"
         self.audio_var.set(audio)
         self.audio_state_var.set(audio)
+        self._refresh_microphone_ui()
         self.backlight_var.set(f"{backlight}%" if backlight >= 0 else "--")
         self.resolution_var.set(f"{w}×{h}")
 
-        note = f"{self._build_note}   ·   " if self._build_note else ""
+        note = f"{self._build_note or self._flash_note}   ·   " if (self._build_note or self._flash_note) else ""
         location = self._document_status()
         self.status_left_var.set(
             f"{note}后端  {self.backend_var.get()}   ·   分辨率  {w}×{h}   ·   缩放  {self.zoom_var.get()}{location}"
@@ -1296,6 +1892,11 @@ class IdeApp:
             if answer and not self._save_all():
                 return
         self._running = False
+        if self._log_handle is not None:
+            try:
+                self._log_handle.close()
+            except OSError:
+                pass
         try:
             if self.mic is not None:
                 self.mic.close()
@@ -1305,6 +1906,7 @@ class IdeApp:
 
     def run(self) -> None:
         self.root.after(0, self._tick)
+        self.root.after(WATCH_MS, self._watch_tick)
         self.root.mainloop()
 
 

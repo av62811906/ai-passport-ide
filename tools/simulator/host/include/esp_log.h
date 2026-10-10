@@ -4,6 +4,12 @@
 // to the IDE's registered callback (and mirrors it to stderr).
 #pragma once
 
+// ESP-IDF's esp_log.h pulls these in, and application code relies on that
+// transitive availability (e.g. world.c uses printf/PRId64 without including
+// them itself). Keep the same surface here.
+#include <inttypes.h>
+#include <stdio.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif

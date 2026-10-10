@@ -19,10 +19,12 @@
 
 /* Font sizes enabled on the device (sdkconfig.defaults). The tuner references
  * lv_font_montserrat_14/20/28/48 and uses montserrat_20 as the tuner font's
- * fallback, so all four must be present. */
+ * fallback; the home page draws the user name with montserrat_32, so all five
+ * must be present. */
 #define LV_FONT_MONTSERRAT_14 1
 #define LV_FONT_MONTSERRAT_20 1
 #define LV_FONT_MONTSERRAT_28 1
+#define LV_FONT_MONTSERRAT_32 1
 #define LV_FONT_MONTSERRAT_48 1
 
 #endif /* LV_CONF_H */

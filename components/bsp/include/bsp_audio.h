@@ -10,6 +10,11 @@
 // 失败会释放本次已创建的 codec 接口和 I2S channel，修正故障后可重试。
 esp_err_t bsp_audio_init(void);
 
+// 播放任务静音/空闲时挂起输出:校验 codec 睡眠并停止 I2S TX/RX 时钟。
+// 失败可重试;下次 bsp_audio_set_format() 会以所选格式恢复。
+// 本实现复用 bsp_audio_sleep() 的完整 suspend 序列。
+esp_err_t bsp_audio_suspend(void);
+
 // 设置采样格式。同格式重复调用是廉价的(直接复用已打开的 codec)。
 //
 // ⚠ 这里有个必须绕开的坑:esp_codec_dev_open() 在 codec【已打开】时会直接返回 OK 且
